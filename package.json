@@ -5,6 +5,14 @@
   "type": "module",
   "license": "MIT",
   "author": "barbadz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Barba-Tech-CO/pi-ai-bridge.git"
+  },
+  "homepage": "https://github.com/Barba-Tech-CO/pi-ai-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/Barba-Tech-CO/pi-ai-bridge/issues"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
