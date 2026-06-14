@@ -28,14 +28,19 @@ export default function aiBridge(pi: ExtensionAPI): void {
   }
 
   // ─── Tools (LLM-callable) ────────────────────────────────────────
+  const defaultWaitMs = 120000;
+
   pi.registerTool({
     name: "ask_ai",
     label: "Ask AI",
     description:
-      "Delegate a task to another AI CLI (claude, codex, or gemini) as a background full-autonomy agent. Returns a jobId immediately; poll with check_ai. The external agent can read and edit files in cwd.",
+      "Delegate a task to another AI CLI (claude, codex, or gemini) as a full-autonomy agent that can read and edit files in cwd. " +
+      "By default runs in the BACKGROUND and returns a jobId immediately (poll with check_ai). " +
+      "For a simple/quick question, pass wait:true to BLOCK until it finishes and get the answer inline on screen.",
     promptGuidelines: [
-      "Use ask_ai to get a second opinion or run an independent subtask in parallel; it does not block.",
-      "After ask_ai, continue your own work and poll check_ai for the result instead of waiting idle.",
+      "For a quick question or short task where you want the answer now, call ask_ai with wait:true — the output comes back inline, no polling needed.",
+      "For long or open-ended work, leave wait off (background): you get a jobId, keep working, and poll check_ai later.",
+      "wait blocks up to timeoutMs (default 120000ms); if it times out the job keeps running and you can still check_ai it.",
     ],
     parameters: Type.Object({
       provider: Type.Union(
@@ -43,6 +48,8 @@ export default function aiBridge(pi: ExtensionAPI): void {
         { description: "Which CLI agent to use" },
       ),
       prompt: Type.String({ description: "The task / question for the external agent" }),
+      wait: Type.Optional(Type.Boolean({ description: "If true, block until the agent finishes and return its output inline (good for simple tasks). Default false = background." })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max ms to block when wait is true (default 120000). On timeout the job keeps running." })),
       cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the session cwd" })),
       model: Type.Optional(Type.String({ description: "Optional model override for the external CLI" })),
     }),
@@ -50,6 +57,15 @@ export default function aiBridge(pi: ExtensionAPI): void {
       try {
         const cwd = params.cwd ?? ctx.cwd;
         const job = startJob(params.provider, params.prompt, cwd, params.model);
+        if (params.wait) {
+          const timeoutMs = params.timeoutMs ?? defaultWaitMs;
+          const final = await jobs.wait(job.id, timeoutMs);
+          const out = jobs.tail(job.id, 200);
+          if (final.status === "running") {
+            return text(`Job ${job.id} still running after ${timeoutMs}ms (left in background; use check_ai).\n\n${out || "(no output yet)"}`);
+          }
+          return text(`[${params.provider}] status=${final.status} exitCode=${final.exitCode ?? "-"}\n\n${out || "(no output)"}`, final.status !== "done");
+        }
         return text(`Started ${params.provider} job ${job.id} in ${cwd}. Poll with check_ai({ jobId: "${job.id}" }).`);
       } catch (e) {
         return text(e instanceof Error ? e.message : String(e), true);
@@ -103,27 +119,72 @@ export default function aiBridge(pi: ExtensionAPI): void {
   });
 
   // ─── Slash commands (user-triggered) ─────────────────────────────
+  const helpText = [
+    "pi-ai-bridge — delegate to external AI CLIs (claude, codex, gemini).",
+    "",
+    "  /ask <provider> <prompt>      start a background agent (then /ai-result)",
+    "  /ask-wait <provider> <prompt> run and show the output here (blocks)",
+    "  /ai-jobs                      list recent/running jobs",
+    "  /ai-result [id] [lines]       show a job's status + output (no id = latest job)",
+    "  /ai-cancel <id>               cancel a running job",
+    "  /ai-help                      this help",
+    "",
+    `  providers: ${PROVIDER_NAMES.join(", ")}`,
+    "  the model can also call these on its own via the ask_ai / check_ai tools.",
+  ].join("\n");
+
+  function providerCompletions(prefix: string) {
+    const tokens = prefix.trimStart().split(/\s+/).filter(Boolean);
+    if (tokens.length <= 1 && !/\s$/.test(prefix)) {
+      return PROVIDER_NAMES.filter((p) => p.startsWith(tokens[0] ?? "")).map((p) => ({ value: p, label: p }));
+    }
+    return null;
+  }
+
+  function parseProviderAndPrompt(args: string): { providerName: string; prompt: string } | null {
+    const trimmed = args.trim();
+    const space = trimmed.indexOf(" ");
+    if (space < 0) return null;
+    return { providerName: trimmed.slice(0, space), prompt: trimmed.slice(space + 1).trim() };
+  }
+
   pi.registerCommand("ask", {
-    description: "Delegate a task to an external AI CLI: /ask <claude|codex|gemini> <prompt>",
-    getArgumentCompletions: (prefix: string) => {
-      const tokens = prefix.trimStart().split(/\s+/).filter(Boolean);
-      if (tokens.length <= 1 && !/\s$/.test(prefix)) {
-        return PROVIDER_NAMES.filter((p) => p.startsWith(tokens[0] ?? "")).map((p) => ({ value: p, label: p }));
-      }
-      return null;
-    },
+    description: "Start a background AI agent: /ask <claude|codex|gemini> <prompt> — then view with /ai-result",
+    getArgumentCompletions: providerCompletions,
     handler: async (args: string, ctx: ExtensionContext) => {
-      const trimmed = args.trim();
-      const space = trimmed.indexOf(" ");
-      if (space < 0) {
-        ctx.ui.notify("Usage: /ask <claude|codex|gemini> <prompt>", "error");
+      const parsed = parseProviderAndPrompt(args);
+      if (!parsed || !parsed.prompt) {
+        ctx.ui.notify("Usage: /ask <claude|codex|gemini> <prompt>\nExample: /ask gemini summarize README.md\nTip: /ask-wait runs and shows the output here.", "error");
         return;
       }
-      const providerName = trimmed.slice(0, space);
-      const prompt = trimmed.slice(space + 1).trim();
       try {
-        const job = startJob(providerName, prompt, ctx.cwd, undefined);
-        ctx.ui.notify(`Started ${providerName} job ${job.id}. Use /ai-result ${job.id} to see output.`, "info");
+        const job = startJob(parsed.providerName, parsed.prompt, ctx.cwd, undefined);
+        ctx.ui.notify(`Started ${parsed.providerName} job: ${job.id}\nView output: /ai-result (or /ai-result ${job.id})`, "info");
+      } catch (e) {
+        ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
+      }
+    },
+  });
+
+  pi.registerCommand("ask-wait", {
+    description: "Run an AI agent and show its output here (blocks): /ask-wait <claude|codex|gemini> <prompt>",
+    getArgumentCompletions: providerCompletions,
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const parsed = parseProviderAndPrompt(args);
+      if (!parsed || !parsed.prompt) {
+        ctx.ui.notify("Usage: /ask-wait <claude|codex|gemini> <prompt>\nExample: /ask-wait claude what does package.json declare?", "error");
+        return;
+      }
+      try {
+        const job = startJob(parsed.providerName, parsed.prompt, ctx.cwd, undefined);
+        ctx.ui.notify(`Running ${parsed.providerName} (${job.id})…`, "info");
+        const final = await jobs.wait(job.id, defaultWaitMs);
+        const out = jobs.tail(job.id, 200);
+        if (final.status === "running") {
+          ctx.ui.notify(`Still running after ${defaultWaitMs}ms — left in background. /ai-result ${job.id}\n\n${out}`, "warning");
+          return;
+        }
+        ctx.ui.notify(`[${parsed.providerName}] ${final.status} (exit ${final.exitCode ?? "-"})\n\n${out || "(no output)"}`, final.status === "done" ? "info" : "error");
       } catch (e) {
         ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
       }
@@ -131,25 +192,27 @@ export default function aiBridge(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("ai-jobs", {
-    description: "List background AI jobs",
+    description: "List recent and running AI jobs",
     handler: async (_args: string, ctx: ExtensionContext) => {
       const list = jobs.list();
-      ctx.ui.notify(list.length ? list.map(formatJob).join("\n") : "No jobs yet.", "info");
+      ctx.ui.notify(list.length ? list.map(formatJob).join("\n") : "No jobs yet. Start one with /ask or /ask-wait.", "info");
     },
   });
 
   pi.registerCommand("ai-result", {
-    description: "Show status + output of a job: /ai-result <id> [lines]",
+    description: "Show a job's status + output: /ai-result [id] [lines] — no id uses the latest job",
     handler: async (args: string, ctx: ExtensionContext) => {
-      const [id, linesStr] = args.trim().split(/\s+/);
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const id = parts[0] ?? jobs.list()[0]?.id;
+      const linesStr = parts[0] ? parts[1] : undefined;
       if (!id) {
-        ctx.ui.notify("Usage: /ai-result <id> [lines]", "error");
+        ctx.ui.notify("No jobs yet. Start one with /ask or /ask-wait.", "error");
         return;
       }
       try {
         const job = jobs.get(id);
         const out = jobs.tail(id, linesStr ? Number(linesStr) : 200);
-        ctx.ui.notify(`status=${job.status} exitCode=${job.exitCode ?? "-"}\n\n${out || "(no output yet)"}`, "info");
+        ctx.ui.notify(`${job.id} [${job.provider}] ${job.status} (exit ${job.exitCode ?? "-"})\n\n${out || "(no output yet)"}`, "info");
       } catch (e) {
         ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
       }
@@ -157,11 +220,11 @@ export default function aiBridge(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("ai-cancel", {
-    description: "Cancel a background AI job: /ai-cancel <id>",
+    description: "Cancel a running AI job: /ai-cancel <id> (see ids with /ai-jobs)",
     handler: async (args: string, ctx: ExtensionContext) => {
       const id = args.trim();
       if (!id) {
-        ctx.ui.notify("Usage: /ai-cancel <id>", "error");
+        ctx.ui.notify("Usage: /ai-cancel <id>\nList ids with /ai-jobs.", "error");
         return;
       }
       try {
@@ -170,6 +233,13 @@ export default function aiBridge(pi: ExtensionAPI): void {
       } catch (e) {
         ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
       }
+    },
+  });
+
+  pi.registerCommand("ai-help", {
+    description: "Show pi-ai-bridge commands and providers",
+    handler: async (_args: string, ctx: ExtensionContext) => {
+      ctx.ui.notify(helpText, "info");
     },
   });
 }

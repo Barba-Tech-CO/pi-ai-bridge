@@ -1,6 +1,6 @@
 {
   "name": "pi-ai-bridge",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Pi extension to delegate tasks to external AI CLIs (claude, codex, gemini) as background agents",
   "type": "module",
   "license": "MIT",

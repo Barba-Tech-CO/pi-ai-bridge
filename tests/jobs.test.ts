@@ -60,6 +60,26 @@ test("cancel marks canceled", async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("wait resolves with terminal status when job finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "aibridge-"));
+  const mgr = new JobManager(dir, () => ({ bin: "node", args: ["-e", "console.log('done')"] }));
+  const job = mgr.start({ provider: "gemini", prompt: "x", cwd: dir, model: undefined });
+  const final = await mgr.wait(job.id, 5000);
+  assert.equal(final.status, "done");
+  assert.equal(final.exitCode, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("wait returns still-running job when it times out", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "aibridge-"));
+  const mgr = new JobManager(dir, () => ({ bin: "node", args: ["-e", "setTimeout(()=>{}, 60000)"] }));
+  const job = mgr.start({ provider: "claude", prompt: "x", cwd: dir, model: undefined });
+  const result = await mgr.wait(job.id, 300);
+  assert.equal(result.status, "running");
+  mgr.cancel(job.id);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("get/cancel on unknown id throws friendly error", () => {
   const dir = mkdtempSync(join(tmpdir(), "aibridge-"));
   const mgr = new JobManager(dir, () => ({ bin: "node", args: [] }));

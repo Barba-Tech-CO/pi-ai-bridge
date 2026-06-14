@@ -31,7 +31,7 @@ Restart Pi to load it.
 
 | Tool | Purpose |
 |---|---|
-| `ask_ai({ provider, prompt, cwd?, model? })` | Start a background agent. Returns a `jobId` immediately. |
+| `ask_ai({ provider, prompt, wait?, timeoutMs?, cwd?, model? })` | Start an agent. Background by default (returns a `jobId`); pass `wait: true` to block and return the output inline. |
 | `check_ai({ jobId, tailLines? })` | Status + output tail of a job. |
 | `list_ai()` | Recent / running jobs. |
 | `cancel_ai({ jobId })` | Kill a running job. |
@@ -39,10 +39,12 @@ Restart Pi to load it.
 ## Slash commands (you trigger these)
 
 ```text
-/ask <claude|codex|gemini> <prompt>   start a background agent
-/ai-jobs                              list jobs
-/ai-result <id> [lines]               show status + output
-/ai-cancel <id>                       cancel a job
+/ask <claude|codex|gemini> <prompt>        start a background agent
+/ask-wait <claude|codex|gemini> <prompt>   run and show the output here (blocks)
+/ai-jobs                                   list jobs
+/ai-result [id] [lines]                    show status + output (no id = latest job)
+/ai-cancel <id>                            cancel a job
+/ai-help                                   list commands and providers
 ```
 
 ## Providers

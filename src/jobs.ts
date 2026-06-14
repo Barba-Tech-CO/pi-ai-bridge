@@ -119,6 +119,19 @@ export class JobManager {
     }
   }
 
+  async wait(id: string, timeoutMs: number): Promise<Job> {
+    const started = Date.now();
+    return new Promise((resolve) => {
+      const tick = () => {
+        const job = this.get(id);
+        if (job.status !== "running") return resolve(job);
+        if (Date.now() - started > timeoutMs) return resolve(job); // still running on timeout
+        setTimeout(tick, 200);
+      };
+      tick();
+    });
+  }
+
   tail(id: string, lines: number): string {
     const p = this.logPath(id);
     if (!existsSync(p)) return "";
