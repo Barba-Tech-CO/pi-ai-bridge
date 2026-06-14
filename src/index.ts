@@ -2,16 +2,47 @@ import { join } from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Providers, resolveProvider, assertAvailable, PROVIDER_NAMES, type Provider } from "./providers.js";
-import { JobManager, type Job, type JobSpec } from "./jobs.js";
+import { JobManager, type Job, type JobStatus, type JobSpec } from "./jobs.js";
 
-function text(t: string, isError = false) {
-  return { content: [{ type: "text" as const, text: t }], isError, details: undefined };
+interface AiDetails {
+  status?: JobStatus;
+  exitCode?: number;
+}
+
+function result(t: string, details: AiDetails = {}, isError = false) {
+  return { content: [{ type: "text" as const, text: t }], isError, details };
 }
 
 function formatJob(j: Job): string {
   const code = j.exitCode === undefined ? "" : ` (exit ${j.exitCode})`;
   return `${j.id} [${j.provider}] ${j.status}${code}`;
+}
+
+// Minimal shape of the runtime Theme we use (avoids importing the concrete class).
+interface ThemeLike {
+  fg(color: string, text: string): string;
+  bold(text: string): string;
+}
+
+function statusColor(status: JobStatus | undefined, isError: boolean): string {
+  if (isError) return "error";
+  switch (status) {
+    case "done": return "success";
+    case "failed": return "error";
+    case "canceled": return "muted";
+    case "running": return "warning";
+    default: return "accent";
+  }
+}
+
+// Color the first line by job status, the rest as tool output.
+function styleToolText(theme: ThemeLike, raw: string, details: AiDetails | undefined, isError: boolean): string {
+  const [first, ...rest] = raw.split("\n");
+  const head = theme.bold(theme.fg(statusColor(details?.status, isError), first ?? ""));
+  if (!rest.length) return head;
+  return head + "\n" + theme.fg("toolOutput", rest.join("\n"));
 }
 
 export default function aiBridge(pi: ExtensionAPI): void {
@@ -24,8 +55,63 @@ export default function aiBridge(pi: ExtensionAPI): void {
   function startJob(providerName: string, prompt: string, cwd: string, model: string | undefined): Job {
     const provider = resolveProvider(providerName);
     assertAvailable(provider);
-    return jobs.start({ provider, prompt, cwd, model });
+    const job = jobs.start({ provider, prompt, cwd, model });
+    refreshRunningWidget();
+    return job;
   }
+
+  // ─── Styled tool result rendering ────────────────────────────────
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function renderJobResult(res: any, _opts: any, theme: any, ctx: any) {
+    const prev = ctx?.lastComponent;
+    const component = prev instanceof Text ? prev : new Text("", 0, 0);
+    const raw: string = (res?.content ?? []).map((c: { text?: string }) => c.text ?? "").join("");
+    component.setText(styleToolText(theme, raw, res?.details as AiDetails | undefined, Boolean(res?.isError)));
+    return component;
+  }
+
+  // ─── "Agents running" widget below the input ─────────────────────
+  let widgetCtx: ExtensionContext | undefined;
+  let widgetTimer: ReturnType<typeof setInterval> | undefined;
+
+  function refreshRunningWidget(): void {
+    if (!widgetCtx) return;
+    const running = jobs.list().filter((j) => j.status === "running");
+    if (!running.length) {
+      widgetCtx.ui.setWidget("ai-bridge-running", undefined);
+      return;
+    }
+    const now = Date.now();
+    widgetCtx.ui.setWidget(
+      "ai-bridge-running",
+      (_tui, theme) => {
+        const lines = [
+          theme.fg("warning", `⏳ ${running.length} AI agent${running.length > 1 ? "s" : ""} running`),
+          ...running.map((j) => {
+            const secs = Math.round((now - j.startedAt) / 1000);
+            return (
+              "  " + theme.fg("warning", "●") + " " + theme.bold(j.provider) +
+              theme.fg("muted", ` ${j.id}`) + theme.fg("dim", ` ${secs}s`)
+            );
+          }),
+        ];
+        return new Text(lines.join("\n"), 0, 0);
+      },
+      { placement: "belowEditor" },
+    );
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    widgetCtx = ctx;
+    refreshRunningWidget();
+    widgetTimer = setInterval(refreshRunningWidget, 1500);
+    (widgetTimer as { unref?: () => void }).unref?.();
+  });
+
+  pi.on("session_shutdown", () => {
+    if (widgetTimer) clearInterval(widgetTimer);
+    widgetCtx?.ui.setWidget("ai-bridge-running", undefined);
+  });
 
   // ─── Tools (LLM-callable) ────────────────────────────────────────
   const defaultWaitMs = 120000;
@@ -53,6 +139,7 @@ export default function aiBridge(pi: ExtensionAPI): void {
       cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the session cwd" })),
       model: Type.Optional(Type.String({ description: "Optional model override for the external CLI" })),
     }),
+    renderResult: renderJobResult,
     execute: async (_id, params, _signal, _onUpdate, ctx: ExtensionContext) => {
       try {
         const cwd = params.cwd ?? ctx.cwd;
@@ -60,15 +147,16 @@ export default function aiBridge(pi: ExtensionAPI): void {
         if (params.wait) {
           const timeoutMs = params.timeoutMs ?? defaultWaitMs;
           const final = await jobs.wait(job.id, timeoutMs);
+          refreshRunningWidget();
           const out = jobs.tail(job.id, 200);
           if (final.status === "running") {
-            return text(`Job ${job.id} still running after ${timeoutMs}ms (left in background; use check_ai).\n\n${out || "(no output yet)"}`);
+            return result(`Job ${job.id} still running after ${timeoutMs}ms (left in background; use check_ai).\n\n${out || "(no output yet)"}`, { status: "running" });
           }
-          return text(`[${params.provider}] status=${final.status} exitCode=${final.exitCode ?? "-"}\n\n${out || "(no output)"}`, final.status !== "done");
+          return result(`[${params.provider}] ${final.status} (exit ${final.exitCode ?? "-"})\n\n${out || "(no output)"}`, { status: final.status, exitCode: final.exitCode }, final.status !== "done");
         }
-        return text(`Started ${params.provider} job ${job.id} in ${cwd}. Poll with check_ai({ jobId: "${job.id}" }).`);
+        return result(`Started ${params.provider} job ${job.id} in ${cwd}. Poll with check_ai({ jobId: "${job.id}" }).`, { status: "running" });
       } catch (e) {
-        return text(e instanceof Error ? e.message : String(e), true);
+        return result(e instanceof Error ? e.message : String(e), {}, true);
       }
     },
   });
@@ -81,13 +169,15 @@ export default function aiBridge(pi: ExtensionAPI): void {
       jobId: Type.String(),
       tailLines: Type.Optional(Type.Number({ description: "How many trailing log lines to return (default 200)" })),
     }),
+    renderResult: renderJobResult,
     execute: async (_id, params) => {
       try {
         const job = jobs.get(params.jobId);
+        refreshRunningWidget();
         const out = jobs.tail(params.jobId, params.tailLines ?? 200);
-        return text(`status=${job.status} exitCode=${job.exitCode ?? "-"}\n\n${out || "(no output yet)"}`);
+        return result(`[${job.provider}] ${job.status} (exit ${job.exitCode ?? "-"})\n\n${out || "(no output yet)"}`, { status: job.status, exitCode: job.exitCode });
       } catch (e) {
-        return text(e instanceof Error ? e.message : String(e), true);
+        return result(e instanceof Error ? e.message : String(e), {}, true);
       }
     },
   });
@@ -97,9 +187,10 @@ export default function aiBridge(pi: ExtensionAPI): void {
     label: "List AI jobs",
     description: "List recent and running background AI jobs.",
     parameters: Type.Object({}),
+    renderResult: renderJobResult,
     execute: async () => {
       const list = jobs.list();
-      return text(list.length ? list.map(formatJob).join("\n") : "No jobs yet.");
+      return result(list.length ? list.map(formatJob).join("\n") : "No jobs yet.");
     },
   });
 
@@ -108,12 +199,14 @@ export default function aiBridge(pi: ExtensionAPI): void {
     label: "Cancel AI job",
     description: "Cancel a running background AI job.",
     parameters: Type.Object({ jobId: Type.String() }),
+    renderResult: renderJobResult,
     execute: async (_id, params) => {
       try {
         const job = jobs.cancel(params.jobId);
-        return text(`Canceled ${job.id}.`);
+        refreshRunningWidget();
+        return result(`Canceled ${job.id}.`, { status: "canceled" });
       } catch (e) {
-        return text(e instanceof Error ? e.message : String(e), true);
+        return result(e instanceof Error ? e.message : String(e), {}, true);
       }
     },
   });

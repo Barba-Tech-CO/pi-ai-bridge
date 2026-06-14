@@ -57,6 +57,14 @@ Restart Pi to load it.
 
 The matching CLI must be installed and on your `PATH`.
 
+## Display
+
+- **Tool results are color-coded by status** (green = done, red = failed, yellow =
+  running, dim = canceled), with a bold header, via the runtime theme.
+- A **"agents running" widget** appears below the input while background agents
+  are active, showing provider, job id and elapsed time — similar to background
+  tasks in Claude Code.
+
 ## Job state
 
 Background jobs are tracked in `~/.pi/agent/ai-bridge/jobs/` as `<id>.json`
